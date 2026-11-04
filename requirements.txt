@@ -6,4 +6,7 @@ pystac-client>=0.9
 httpx>=0.28
 python-dotenv>=1.1
 truststore>=0.10
+numpy>=2.0
+rasterio>=1.4             # windowed COG reads (bundles GDAL)
+matplotlib>=3.9           # analysis PNG
 pytest>=9

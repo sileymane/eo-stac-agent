@@ -1,0 +1,9 @@
+# Secrets: API keys live here. Copy .env.example instead.
+.env
+
+# Analysis results (PNG maps, provenance records) are run outputs, not source.
+outputs/
+
+__pycache__/
+*.pyc
+.pytest_cache/

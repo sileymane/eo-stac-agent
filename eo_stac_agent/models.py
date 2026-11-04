@@ -1,13 +1,18 @@
 """Data models shared by the graph nodes."""
 from datetime import date
-from typing import Literal, TypedDict
+from typing import Annotated, Literal, TypedDict
 
+from langchain_core.messages import AnyMessage
+from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
 
 Collection = Literal["sentinel-2-l2a", "landsat-c2-l2", "sentinel-1-grd"]
+SpectralIndex = Literal["ndvi", "ndwi"]
 
 # Collections where a cloud-cover filter makes sense (SAR sees through clouds).
 OPTICAL_COLLECTIONS = {"sentinel-2-l2a", "landsat-c2-l2"}
+# Collections whose pixels the analysis can read (Earth Search Landsat is in a requester-pays bucket).
+ANALYSIS_COLLECTIONS = {"sentinel-2-l2a"}
 
 
 class SearchRequest(BaseModel):
@@ -29,14 +34,35 @@ class SearchRequest(BaseModel):
         None, ge=0, le=100, description="Maximum cloud cover in percent. Null if not mentioned or for SAR."
     )
     limit: int = Field(5, ge=1, le=50, description="How many products the user wants back.")
+    index: SpectralIndex | None = Field(
+        None,
+        description="Spectral index to compute on the pixels, only if the user asks an analysis question: "
+        "ndvi for vegetation/greenness/crops/drought, ndwi for water/flooding/lakes. Null for a plain data search.",
+    )
+    baseline_start_date: date | None = Field(
+        None,
+        description="Start of an earlier period to compare against, only for change questions "
+        "('between July and August', 'compared to last year'). The later period goes in start_date/end_date.",
+    )
+    baseline_end_date: date | None = Field(None, description="End of the earlier comparison period (inclusive).")
+
+    @property
+    def has_baseline(self) -> bool:
+        return self.baseline_start_date is not None and self.baseline_end_date is not None
 
 
 class AgentState(TypedDict, total=False):
-    query: str                # the original user sentence
+    # With a checkpointer, state persists across turns of a thread: parse_request resets the per-turn fields.
+    messages: Annotated[list[AnyMessage], add_messages]  # conversation so far (appended, never replaced)
+    query: str                # the current user sentence
+    parsed_request: SearchRequest  # parameters as the LLM parsed them; follow-ups start from these
     request: SearchRequest    # current search parameters (may be relaxed over time)
-    bbox: list[float]         # resolved area of interest
+    bbox: list[float] | None  # resolved area of interest
     items: list[dict]         # ranked search results
+    baseline_items: list[dict]  # ranked results for the baseline period (change questions only)
     attempts: int             # number of STAC searches performed
     relaxations: list[str]    # human-readable log of what was relaxed
-    error: str                # set when a step fails unrecoverably
+    analysis: dict | None     # index statistics + output paths, when an index was requested
+    analysis_error: str | None  # analysis failed; the search results are still reported
+    error: str | None         # set when a step fails unrecoverably
     answer: str               # final response for the user

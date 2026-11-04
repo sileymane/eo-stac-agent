@@ -60,6 +60,9 @@ def rank_items(items: list[dict], limit: int) -> list[dict]:
     return by_cloud[:limit]
 
 
+ANALYSIS_BANDS = ("red", "nir", "green", "scl")  # Earth Search Sentinel-2 asset keys used by analysis.py
+
+
 def _summarize_item(item) -> dict:
     props = item.properties
     thumbnail = item.assets.get("thumbnail")
@@ -74,4 +77,11 @@ def _summarize_item(item) -> dict:
         "thumbnail": thumbnail.href if thumbnail else None,
         "visual": visual.href if visual else None,
         "stac_url": item.get_self_href(),
+        "bands": {k: _band(item.assets[k]) for k in ANALYSIS_BANDS if k in item.assets},
     }
+
+
+def _band(asset) -> dict:
+    """COG href plus the DN -> reflectance conversion published in the STAC raster extension."""
+    raster = (asset.extra_fields.get("raster:bands") or [{}])[0]
+    return {"href": asset.href, "scale": raster.get("scale", 1.0), "offset": raster.get("offset", 0.0)}
