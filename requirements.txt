@@ -1,6 +1,7 @@
 langgraph>=1.2
 langchain>=1.4
 langchain-openai>=1.6
+langchain-openrouter>=0.2  # LLM_MODEL=openrouter:vendor/model
 # langchain-google-genai>=4.4   # uncomment to use Gemini
 pystac-client>=0.9
 httpx>=0.28

@@ -68,7 +68,7 @@ graph TD
 
 ```powershell
 pip install -r requirements.txt
-copy .env.example .env        # then set OPENAI_API_KEY (or switch LLM_MODEL to Gemini)
+copy .env.example .env        # then set your API key: see Configuration below
 python -m eo_stac_agent "Sentinel-2 over Toulouse in July 2025, less than 10% cloud"
 python -m eo_stac_agent       # interactive mode (follow-ups; 'new' starts a fresh conversation)
 python -m eo_stac_agent --graph
@@ -89,6 +89,36 @@ Follow-ups start from the request *as you asked it*, not as relaxed: after a sea
 
 Supported collections (Earth Search): `sentinel-2-l2a`, `landsat-c2-l2`, `sentinel-1-grd`.
 Point `STAC_URL` at any other STAC API (e.g. your internal catalog) to reuse the agent.
+
+## Configuration
+
+Settings are read from `.env` (start from `.env.example`). `.env` holds your API keys and is git-ignored:
+never commit it.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LLM_MODEL` | `openai:gpt-4.1-mini` | `provider:model` in LangChain `init_chat_model` format, e.g. `google_genai:gemini-3.5-flash` or `openrouter:google/gemini-3.5-flash` |
+| `OPENAI_API_KEY` / `GOOGLE_API_KEY` / `OPENROUTER_API_KEY` | none | Key for the provider in `LLM_MODEL` |
+| `LLM_TIMEOUT` | `60` | Seconds before an LLM request is abandoned; it is retried once |
+| `LLM_REASONING_EFFORT` | `low` for Gemini, unset otherwise | `low` / `medium` / `high`. Parsing and summarizing need little reasoning, and higher is much slower. Sent to OpenRouter only when set |
+| `STAC_URL` | Earth Search | Any STAC API |
+| `OUTPUT_DIR` | `outputs` | Where analysis runs write `analysis.png` and `provenance.json` |
+| `USE_SYSTEM_CERTS` | `true` | Trust the OS certificate store, needed behind TLS-inspecting corporate proxies |
+| `NOMINATIM_URL`, `NOMINATIM_USER_AGENT` | OSM Nominatim | Geocoder; its usage policy requires an identifying User-Agent |
+
+Notes from running it:
+
+- **Variables already set in your shell win over `.env`** (`load_dotenv` does not override them). If a
+  change in `.env` seems ignored, check `$env:LLM_MODEL` in PowerShell and `Remove-Item Env:LLM_MODEL`.
+- **Gemini availability varies by model.** Retired or overloaded models return `404 NOT_FOUND`,
+  `503 UNAVAILABLE` or `504 DEADLINE_EXCEEDED`. The agent then ends with a clear message, or with a plain
+  results table if only the summary failed. Switching `LLM_MODEL` to another model your key lists
+  (`gemini-3.5-flash` worked when the newer flash models were overloaded) usually fixes it.
+- Some Gemini models reject `LLM_REASONING_EFFORT=minimal` with `400 INVALID_ARGUMENT`; use `low`.
+- **OpenRouter** gives one key for many vendors' models (OpenAI, Google, Anthropic, Mistral, open-weight
+  models...), which is handy when one provider is overloaded: switch `LLM_MODEL`, not your key. Model ids
+  are `vendor/model` as listed on https://openrouter.ai/models. Choose one that supports **tool calling**,
+  because `parse_request` relies on it for structured output.
 
 ## Exercises to go further
 

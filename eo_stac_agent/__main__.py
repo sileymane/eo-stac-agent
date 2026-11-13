@@ -1,12 +1,15 @@
 """CLI entry point: python -m eo_stac_agent "Sentinel-2 over Toulouse in July 2025, <10% cloud" """
 import argparse
 import os
+import sys
 import uuid
 
 from dotenv import load_dotenv
 
 
 def main() -> None:
+    # LLM answers may contain emoji; redirected output on Windows defaults to cp1252 and would crash.
+    sys.stdout.reconfigure(encoding="utf-8")
     load_dotenv()
     if os.getenv("USE_SYSTEM_CERTS", "true").lower() == "true":
         # Trust the Windows/macOS certificate store (needed behind TLS-inspecting corporate proxies).

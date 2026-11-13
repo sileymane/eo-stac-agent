@@ -17,11 +17,13 @@ class FakeLLM:
     def __init__(self, requests: list[SearchRequest]):
         self.requests = list(requests)
         self.parse_prompts = []
+        self.summary_prompts = []
 
     def with_structured_output(self, schema, **kwargs):
         return FakeParser(self)
 
     def invoke(self, prompt):
+        self.summary_prompts.append(prompt)
         return AIMessage(content="SUMMARY")
 
 
@@ -262,3 +264,48 @@ def test_index_on_unsupported_collection_reports_search_only(setup, outputs):
     assert "only available for sentinel-2-l2a" in result["analysis_error"]
     assert result["answer"] == "SUMMARY"
     assert list(outputs.iterdir()) == []
+
+
+# --- provider settings --------------------------------------------------------
+
+@pytest.mark.parametrize("model, effort, expected", [
+    ("openai:gpt-4.1-mini", "", {"max_retries": 1, "timeout": 60.0}),
+    # google-genai counts the first request as an attempt, and thinks slowly unless told otherwise.
+    ("google_genai:gemini-3.5-flash", "", {"max_retries": 2, "timeout": 60.0, "reasoning_effort": "low"}),
+    # langchain-openrouter takes milliseconds: 60 would be a 60 ms timeout.
+    ("openrouter:google/gemini-3.5-flash", "", {"max_retries": 1, "timeout": 60_000}),
+    ("openrouter:google/gemini-3.5-flash", "low", {"max_retries": 1, "timeout": 60_000, "reasoning": {"effort": "low"}}),
+])
+def test_get_llm_provider_settings(monkeypatch, model, effort, expected):
+    calls = []
+    monkeypatch.setattr(graph, "init_chat_model", lambda m, **kw: calls.append((m, kw)))
+    monkeypatch.setenv("LLM_MODEL", model)
+    monkeypatch.setenv("LLM_REASONING_EFFORT", effort)
+    graph.get_llm.cache_clear()
+    try:
+        graph.get_llm()
+    finally:
+        graph.get_llm.cache_clear()
+    (called_model, kwargs), = calls
+    assert called_model == model
+    assert {k: v for k, v in kwargs.items() if k != "temperature"} == expected
+
+
+def test_two_period_search_without_index_shows_both_periods_to_summary(setup):
+    # Seen live: a model parsed both periods but no index; the summary, shown only the target
+    # results, then claimed the baseline period had no images.
+    by_period = {date(2025, 6, 1): [s2("JUNE", "2025-06-15")], date(2025, 7, 1): [s2("JULY", "2025-07-15")]}
+    setup(july(baseline_start_date=date(2025, 6, 1), baseline_end_date=date(2025, 6, 30)),
+          lambda start: by_period[start])
+    result = graph.build_graph().invoke({"query": "q"})
+
+    assert result["analysis"] is None
+    prompt = graph.get_llm().summary_prompts[-1]
+    assert '"id": "JUNE"' in prompt and '"id": "JULY"' in prompt
+    assert "https://cog/" not in prompt  # band hrefs stay out of the prompt
+
+
+def test_single_period_summary_says_no_baseline(setup):
+    setup(july(), [item(5)])
+    graph.build_graph().invoke({"query": "q"})
+    assert "Baseline period results (best first): none" in graph.get_llm().summary_prompts[-1]

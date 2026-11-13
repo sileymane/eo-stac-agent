@@ -35,7 +35,8 @@ LLM_RETRIES = 1                                       # retries after the first 
 
 
 def llm_model() -> str:
-    # "provider:model", e.g. "openai:gpt-4.1-mini" or "google_genai:gemini-3.5-flash"
+    # "provider:model", e.g. "openai:gpt-4.1-mini", "google_genai:gemini-3.5-flash"
+    # or "openrouter:google/gemini-3.5-flash" (OpenRouter model ids are "vendor/model")
     return os.getenv("LLM_MODEL", "openai:gpt-4.1-mini")
 
 
@@ -47,7 +48,15 @@ def get_llm():
         # google-genai counts max_retries as total attempts (original included); OpenAI counts retries.
         kwargs["max_retries"] = LLM_RETRIES + 1
         # Parsing and formatting need no deep reasoning; Gemini's default thinking makes calls very slow.
-        kwargs["reasoning_effort"] = os.getenv("LLM_REASONING_EFFORT", "low")
+        kwargs["reasoning_effort"] = os.getenv("LLM_REASONING_EFFORT") or "low"  # blank in .env counts as unset
+    elif model.startswith("openrouter:"):
+        # langchain-openrouter takes the timeout in milliseconds (SDK timeout_ms), not seconds:
+        # passing 60 means 60 ms and every request times out. Its max_retries is a backoff window
+        # (~150 s per unit), not a count.
+        kwargs["timeout"] = int(LLM_TIMEOUT * 1000)
+        if effort := os.getenv("LLM_REASONING_EFFORT"):
+            # OpenRouter fronts many models, not all of which reason: only send it when asked for.
+            kwargs["reasoning"] = {"effort": effort}
     return init_chat_model(model, **kwargs)
 
 
@@ -55,9 +64,13 @@ PARSE_PROMPT = """You convert Earth observation data requests into catalog searc
 Today's date is {today}. Resolve relative dates ("last summer", "past 2 weeks") against it.
 If no date is given, use the last 30 days. If no collection is implied, use sentinel-2-l2a.
 Use sentinel-1-grd for radar/SAR requests, landsat-c2-l2 for Landsat.
-Set index only for analysis questions about vegetation (ndvi) or water (ndwi); index analysis needs
-sentinel-2-l2a. For a change question, the later period is start_date/end_date and the earlier one
-is baseline_start_date/baseline_end_date. If the user names whole months, use the whole months.
+Analysis questions need index (and sentinel-2-l2a): questions about how vegetation, greenness,
+crops or drought look or change -> ndvi; about water, floods or lakes -> ndwi. A request that only
+asks for images/scenes/products gets index = null.
+For a change question, the later period is start_date/end_date and the earlier one is
+baseline_start_date/baseline_end_date. If the user names whole months, use the whole months.
+Example: "How did vegetation around Lyon change between May and August 2024?" -> place "Lyon",
+index "ndvi", baseline 2024-05-01..2024-05-31, start/end 2024-08-01..2024-08-31.
 {followup}
 Request: {query}"""
 
@@ -76,13 +89,16 @@ search results below. Start with one sentence on what was found. If the search h
 say clearly how (the user asked for something stricter). Then give a markdown table with columns:
 date, platform, tile, cloud %, id. After the table, list the STAC item URL of the best product.
 If the analysis note is not "none", say in one sentence that the requested analysis could not be done and why.
+If baseline results are given (not "none"), the user asked about two periods: give a second table for the
+baseline period (start_date/end_date is the later period, baseline_* the earlier one).
 Be concise.
 
 User request: {query}
 Final search parameters: {request}
 Relaxations applied: {relaxations}
 Analysis note: {analysis_note}
-Results (best first): {items}"""
+Results (best first): {items}
+Baseline period results (best first): {baseline_items}"""
 
 ANALYSIS_PROMPT = """You are an Earth observation analyst. Answer the user's question using ONLY the
 numbers below. Never invent values. Index values range from -1 to 1; for NDVI, higher means more
@@ -216,8 +232,9 @@ def _compose_answer(state: AgentState) -> AgentState:
             request=state["request"].model_dump_json(),
             relaxations=state["relaxations"] or "none",
             analysis_note=state.get("analysis_error") or "none",
-            # Band hrefs are for analysis.py, not the reader: keep them out of the prompt.
-            items=json.dumps([{k: v for k, v in i.items() if k != "bands"} for i in state["items"]], indent=1),
+            items=_items_for_prompt(state["items"]),
+            baseline_items=(_items_for_prompt(state.get("baseline_items", []))
+                            if state["request"].has_baseline else "none"),
         )
     try:
         # .text, not .content: Gemini 3.x returns content as a list of blocks.
@@ -225,6 +242,11 @@ def _compose_answer(state: AgentState) -> AgentState:
     except Exception as exc:
         # The search already succeeded: still give the user the products, just without the LLM prose.
         return {"answer": _fallback_answer(state), "error": f"Summary LLM call failed: {exc}"}
+
+
+def _items_for_prompt(items: list[dict]) -> str:
+    # Band hrefs are for analysis.py, not the reader: keep them out of the prompt.
+    return json.dumps([{k: v for k, v in i.items() if k != "bands"} for i in items], indent=1)
 
 
 def _fallback_answer(state: AgentState) -> str:
