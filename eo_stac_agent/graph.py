@@ -65,12 +65,15 @@ Today's date is {today}. Resolve relative dates ("last summer", "past 2 weeks") 
 If no date is given, use the last 30 days. If no collection is implied, use sentinel-2-l2a.
 Use sentinel-1-grd for radar/SAR requests, landsat-c2-l2 for Landsat.
 Analysis questions need index (and sentinel-2-l2a): questions about how vegetation, greenness,
-crops or drought look or change -> ndvi; about water, floods or lakes -> ndwi. A request that only
-asks for images/scenes/products gets index = null.
+crops or drought look or change -> ndvi; about (surface) water, floods, lakes, reservoirs, rivers or
+wetlands -> ndwi. Any question asking how something looks or changed is an analysis question and
+needs an index. A request that only asks for images/scenes/products gets index = null.
 For a change question, the later period is start_date/end_date and the earlier one is
 baseline_start_date/baseline_end_date. If the user names whole months, use the whole months.
-Example: "How did vegetation around Lyon change between May and August 2024?" -> place "Lyon",
+Examples: "How did vegetation around Lyon change between May and August 2024?" -> place "Lyon",
 index "ndvi", baseline 2024-05-01..2024-05-31, start/end 2024-08-01..2024-08-31.
+"How did the water of Lake Chad change between March and October 2023?" -> place "Lake Chad",
+index "ndwi", baseline 2023-03-01..2023-03-31, start/end 2023-10-01..2023-10-31.
 {followup}
 Request: {query}"""
 
@@ -102,14 +105,22 @@ Baseline period results (best first): {baseline_items}"""
 
 ANALYSIS_PROMPT = """You are an Earth observation analyst. Answer the user's question using ONLY the
 numbers below. Never invent values. Index values range from -1 to 1; for NDVI, higher means more
-or healthier vegetation; for NDWI, positive values usually indicate open water.
+or healthier vegetation; for NDWI (McFeeters, green-NIR), positive values usually indicate open water.
+Name the index exactly as analysis.index_definition.name, never just "NDWI".
+For NDWI, answer with water area. For a change, lead with change.water (gained, lost and net km2, on
+ground clear on both dates); never present the per-date water_km2 totals as the change, because each
+counts only that date's clear pixels and they may cover different ground. Do not use mean NDWI as a
+measure of water: over a box that is mostly land it falls when vegetation greens.
 
 Format:
 1. Two or three sentences answering the question directly, citing the key numbers (means, share of
-   pixels that increased/decreased).
+   pixels that increased/decreased). If analysis.comparability.same_season is false, say here, not only
+   under Confidence, that the dates are in different seasons and part of the change is probably seasonal.
+   Say it in plain words; never quote field names.
 2. **Confidence**: one or two sentences grounded in the uncertainty notes. You may name plausible
    causes (season, rainfall, harvest) only as hypotheses to check, never as findings.
-3. **Data**: scene id and acquisition date used for each period; mention any search relaxation.
+3. **Data**: acquisition date and scene id(s) used for each period (several tiles of one overpass may be
+   mosaicked); mention any search relaxation.
 4. **Outputs**: the PNG and provenance file paths.
 
 User question: {query}
@@ -121,7 +132,7 @@ Analysis: {analysis}"""
 
 def parse_request(state: AgentState) -> AgentState:
     # Reset everything left over from the previous turn of this thread (no-op on a fresh thread).
-    reset = {"error": None, "bbox": None, "items": [], "baseline_items": [], "attempts": 0,
+    reset = {"error": None, "bbox": None, "items": [], "baseline_items": [], "candidates": {}, "attempts": 0,
              "relaxations": [], "analysis": None, "analysis_error": None,
              "messages": [HumanMessage(state["query"])]}
     prompt = PARSE_PROMPT.format(
@@ -161,19 +172,21 @@ def search(state: AgentState) -> AgentState:
     request, bbox = state["request"], state["bbox"]
     attempts = state["attempts"] + 1
     try:
-        update = {"items": _search_window(request, bbox, request.start_date, request.end_date)}
+        found = {"target": _search_window(request, bbox, request.start_date, request.end_date)}
         if request.has_baseline:
-            update["baseline_items"] = _search_window(
-                request, bbox, request.baseline_start_date, request.baseline_end_date
-            )
+            found["baseline"] = _search_window(request, bbox, request.baseline_start_date, request.baseline_end_date)
     except Exception as exc:
         return {"error": f"STAC search failed: {exc}", "attempts": attempts}
-    return {**update, "attempts": attempts}
+    # The user sees the top `limit`; the analysis needs every tile of an overpass, so keep all candidates.
+    update = {"items": tools.rank_items(found["target"], request.limit), "attempts": attempts,
+              "candidates": found if request.index else {}}
+    if "baseline" in found:
+        update["baseline_items"] = tools.rank_items(found["baseline"], request.limit)
+    return update
 
 
 def _search_window(request: SearchRequest, bbox: list[float], start: date, end: date) -> list[dict]:
-    items = tools.search_items(request.collection, bbox, start, end, request.max_cloud_cover)
-    return tools.rank_items(items, request.limit)
+    return tools.search_items(request.collection, bbox, start, end, request.max_cloud_cover)
 
 
 def relax(state: AgentState) -> AgentState:
@@ -257,9 +270,13 @@ def _fallback_answer(state: AgentState) -> str:
     if state.get("analysis_error"):
         lines.append(state["analysis_error"])
     if result := state.get("analysis"):
-        lines += ["", f"{result['index'].upper()} analysis:"]
+        definition = result["index_definition"]
+        lines += ["", f"{definition['name']} analysis, {definition['sentinel2']}:"]
         for name, period in result["periods"].items():
-            lines.append(f"- {name} ({period['scene']['id']}): {period['stats']}")
+            scenes = ", ".join(s["id"] for s in period["scenes"])
+            lines.append(f"- {name} {period['date']} ({scenes}): {period['stats']}")
+            if period.get("water"):
+                lines.append(f"  water: {period['water']}")
         if result["change"]:
             lines.append(f"- change: {result['change']}")
         lines += [f"- caveat: {note}" for note in result["uncertainty"]]

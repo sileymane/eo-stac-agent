@@ -19,10 +19,12 @@ from . import tools
 
 GRID_MAX_PX = 1024        # longest side of the analysis grid; never finer than the 10 m native pixels
 MIN_VALID = 0.5           # a scene needs this share of clear pixels over the area to be used
-MAX_SCENES_TRIED = 3      # per period, clearest first
+MAX_SCENES_TRIED = 3      # acquisition dates tried per period, clearest first
+MAX_TILES = 4             # tiles of one overpass mosaicked together (an area can straddle tile edges)
 CHANGE_THRESHOLD = 0.1    # index change counted as a real increase/decrease
 WELL_COVERED = 0.8        # below this share of clear pixels, flag the result as less reliable
 CLOUD_BUFFER_M = 60       # SCL misses thin cloud edges: also mask this far around clouds/shadows
+WATER_THRESHOLD = 0.0     # McFeeters NDWI above this counts as open water (McFeeters 1996)
 
 # Sentinel-2 Scene Classification (SCL) classes kept as clear observations:
 # 4 vegetation, 5 bare soil, 6 water, 7 unclassified, 11 snow/ice.
@@ -36,6 +38,21 @@ INDEX_EXCLUDED = {"ndvi": (6,)}
 # index -> (a, b) for the normalized difference (a - b) / (a + b)
 INDEX_BANDS = {"ndvi": ("nir", "red"), "ndwi": ("green", "nir")}
 INDEX_CMAP = {"ndvi": "RdYlGn", "ndwi": "RdYlBu"}
+
+# What each label means. "NDWI" names two different indices in the literature, so the label alone is
+# ambiguous: this agent computes McFeeters' green-NIR open-water NDWI, never Gao's NIR-SWIR one.
+# Sentinel-2 band numbers match the Earth Search asset keys in INDEX_BANDS (green B03, red B04, nir B08).
+INDEX_DEFINITIONS = {
+    "ndvi": {"name": "NDVI", "reference": "Rouse et al. (1974)", "measures": "vegetation greenness",
+             "sentinel2": "(B08 - B04) / (B08 + B04)"},
+    "ndwi": {"name": "NDWI (McFeeters)", "reference": "McFeeters (1996)", "measures": "open surface water",
+             "sentinel2": "(B03 - B08) / (B03 + B08)",
+             "not": "Gao (1996) NDWI, (NIR - SWIR) / (NIR + SWIR), vegetation water content"},
+}
+
+# Dates further apart than this in the annual cycle (ignoring the year) are not seasonally comparable:
+# their difference is likely to include normal phenology (rainy season, crop growth, senescence).
+SEASON_TOLERANCE_DAYS = 30
 
 
 # --- I/O (the only network access; tests replace load_bands) ------------------
@@ -62,19 +79,27 @@ def load_bands(item: dict, names: tuple[str, ...], bbox: list[float], shape: tup
 
 # --- pure computation ---------------------------------------------------------
 
+def _extent_m(bbox: list[float]) -> tuple[float, float]:
+    """(width, height) of the bbox in metres, at its mid latitude."""
+    west, south, east, north = bbox
+    return (east - west) * 111_320 * math.cos(math.radians((south + north) / 2)), (north - south) * 110_574
+
+
 def grid_shape(bbox: list[float]) -> tuple[int, int]:
     """(height, width) of the analysis grid: square-ish pixels, at most GRID_MAX_PX, at least 10 m."""
-    west, south, east, north = bbox
-    width_m = (east - west) * 111_320 * math.cos(math.radians((south + north) / 2))
-    height_m = (north - south) * 110_574
+    width_m, height_m = _extent_m(bbox)
     pixels_long_side = min(GRID_MAX_PX, max(width_m, height_m) / 10)
     metres_per_px = max(width_m, height_m) / pixels_long_side
     return max(1, round(height_m / metres_per_px)), max(1, round(width_m / metres_per_px))
 
 
 def grid_resolution_m(bbox: list[float], shape: tuple[int, int]) -> float:
-    width_m = (bbox[2] - bbox[0]) * 111_320 * math.cos(math.radians((bbox[1] + bbox[3]) / 2))
-    return width_m / shape[1]
+    return _extent_m(bbox)[0] / shape[1]
+
+
+def pixel_area_km2(bbox: list[float], shape: tuple[int, int]) -> float:
+    width_m, height_m = _extent_m(bbox)
+    return width_m / shape[1] * height_m / shape[0] / 1e6
 
 
 def compute_index(index: str, dn: dict, bands: dict, buffer_px: int = 0) -> np.ndarray:
@@ -140,35 +165,90 @@ def change_stats(before: np.ndarray, after: np.ndarray, excluded: float = 0.0) -
     }
 
 
+def mosaic(layers: list[tuple[np.ndarray, np.ndarray]]) -> tuple[np.ndarray, np.ndarray]:
+    """Combine the tiles of one overpass, given as (index values, SCL) on the shared grid.
+
+    Each pixel comes from the first tile that has data there (SCL != 0), values and SCL together,
+    so a pixel that tile flags as cloud stays masked rather than being filled from a neighbour."""
+    values, scl = layers[0][0].copy(), layers[0][1].copy()
+    for tile_values, tile_scl in layers[1:]:
+        fill = (scl == 0) & (tile_scl != 0)
+        values[fill], scl[fill] = tile_values[fill], tile_scl[fill]
+    return values, scl
+
+
+def water_extent(values: np.ndarray, px_km2: float) -> dict:
+    """Open-water area on one date, from NDWI (McFeeters); only clear pixels can be counted."""
+    observed = np.isfinite(values)
+    water = observed & (values > WATER_THRESHOLD)
+    return {"water_km2": _km2(water, px_km2), "observed_km2": _km2(observed, px_km2),
+            "water_share_of_observed": _r(water.sum() / observed.sum()) if observed.any() else None}
+
+
+def water_change(before: np.ndarray, after: np.ndarray, px_km2: float) -> dict:
+    """Water gained and lost, on pixels clear on both dates only (so both totals cover the same ground)."""
+    both = np.isfinite(before) & np.isfinite(after)
+    was, now = both & (before > WATER_THRESHOLD), both & (after > WATER_THRESHOLD)
+    return {"compared_km2": _km2(both, px_km2), "water_before_km2": _km2(was, px_km2),
+            "water_after_km2": _km2(now, px_km2), "gained_km2": _km2(now & ~was, px_km2),
+            "lost_km2": _km2(was & ~now, px_km2), "net_km2": round(_km2(now, px_km2) - _km2(was, px_km2), 2)}
+
+
+def _km2(mask: np.ndarray, px_km2: float) -> float:
+    return round(float(mask.sum() * px_km2), 2)
+
+
 def _r(x) -> float:
     return round(float(x), 3)
 
 
 # --- orchestration --------------------------------------------------------------
 
-def pick_scene(items: list[dict], index: str, bbox: list[float], shape: tuple[int, int]):
-    """Try the clearest scenes in turn; keep the first one that covers the area well enough.
+def acquisitions(items: list[dict]) -> list[list[dict]]:
+    """Group scenes into overpasses (same day, same satellite): the tiles that together cover an area
+    straddling tile edges. Clearest overpass first, then newest; clearest tiles first within each."""
+    def cloud(item):
+        return item["cloud_cover"] if item["cloud_cover"] is not None else 101
 
-    Catalog cloud cover is per tile, not per area: a 5% tile can still be cloudy over the city.
-    Returns (item, index values, excluded fraction, scenes tried)."""
+    groups: dict[tuple, list[dict]] = {}
+    for item in items:
+        groups.setdefault(((item["datetime"] or "")[:10], item["platform"]), []).append(item)
+    newest_first = sorted(groups.values(), key=lambda g: g[0]["datetime"] or "", reverse=True)
+    clearest_first = sorted(newest_first, key=lambda g: sum(map(cloud, g)) / len(g))
+    return [sorted(g, key=cloud)[:MAX_TILES] for g in clearest_first]
+
+
+def pick_acquisition(items: list[dict], index: str, bbox: list[float], shape: tuple[int, int]) -> dict:
+    """Try the clearest overpasses in turn, each mosaicked from its tiles; keep the first that covers
+    the area well enough.
+
+    Catalog cloud cover is per tile, not per area: a 5% tile can still be cloudy over the city, and
+    one tile may cover only part of it. Returns the chosen scenes, index values, SCL mosaic,
+    excluded fraction and the overpasses tried."""
     a_name, b_name = INDEX_BANDS[index]
+    names = (a_name, b_name, "scl")
     buffer_px = math.ceil(CLOUD_BUFFER_M / grid_resolution_m(bbox, shape))
     tried, best = [], None
-    for item in items[:MAX_SCENES_TRIED]:
-        if not {a_name, b_name, "scl"} <= item.get("bands", {}).keys():
+    for overpass in acquisitions(items)[:MAX_SCENES_TRIED]:
+        tiles = [i for i in overpass if set(names) <= i.get("bands", {}).keys()]
+        if not tiles:
             continue
-        dn = load_bands(item, (a_name, b_name, "scl"), bbox, shape)
-        values = compute_index(index, dn, item["bands"], buffer_px)
-        excluded = excluded_fraction(index, dn["scl"])
+        layers = []
+        for item in tiles:
+            dn = load_bands(item, names, bbox, shape)
+            layers.append((compute_index(index, dn, item["bands"], buffer_px), dn["scl"]))
+        values, scl = mosaic(layers)
+        excluded = excluded_fraction(index, scl)
         share = valid_fraction(values, excluded)
-        tried.append({"id": item["id"], "valid_fraction": _r(share)})
-        if best is None or share > best[3]:
-            best = (item, values, excluded, share)
+        tried.append({"date": (tiles[0]["datetime"] or "")[:10], "tiles": [i["id"] for i in tiles],
+                      "valid_fraction": _r(share), "no_data_fraction": _r((scl == 0).mean())})
+        if best is None or share > best["share"]:
+            best = {"scenes": tiles, "values": values, "scl": scl, "excluded": excluded, "share": share}
         if share >= MIN_VALID:
             break
     if best is None:
         raise ValueError("no scene with the bands needed for the analysis")
-    return best[0], best[1], best[2], tried
+    return {**best, "tried": tried}
 
 
 def run(state: dict, llm_model: str) -> dict:
@@ -177,58 +257,114 @@ def run(state: dict, llm_model: str) -> dict:
     shape = grid_shape(bbox)
     out_dir = _output_dir(request.place or "bbox", index)
 
-    target_item, target_values, target_excl, target_tried = pick_scene(state["items"], index, bbox, shape)
-    periods = {"target": _period(request.start_date, request.end_date, target_item, target_values,
-                                 target_excl, target_tried)}
-    baseline_values, change = None, None
-    if request.has_baseline and state.get("baseline_items"):
-        base_item, baseline_values, base_excl, base_tried = pick_scene(state["baseline_items"], index, bbox, shape)
-        periods["baseline"] = _period(request.baseline_start_date, request.baseline_end_date, base_item,
-                                      baseline_values, base_excl, base_tried)
-        change = change_stats(baseline_values, target_values, max(target_excl, base_excl))
+    px_km2 = pixel_area_km2(bbox, shape)
+    # All search results, not only the top `limit` shown to the user: an overpass's other tiles are needed.
+    candidates = state.get("candidates") or {}
 
-    uncertainty = _uncertainty(request, periods, change)
+    target = pick_acquisition(candidates.get("target") or state["items"], index, bbox, shape)
+    periods = {"target": _period(request.start_date, request.end_date, target, index, px_km2)}
+    target_values, baseline_values, change = target["values"], None, None
+    if request.has_baseline and state.get("baseline_items"):
+        base = pick_acquisition(candidates.get("baseline") or state["baseline_items"], index, bbox, shape)
+        periods["baseline"] = _period(request.baseline_start_date, request.baseline_end_date, base, index, px_km2)
+        baseline_values = base["values"]
+        change = change_stats(baseline_values, target_values, max(target["excluded"], base["excluded"]))
+        if index == "ndwi":
+            change["water"] = water_change(baseline_values, target_values, px_km2)
+    comparability = date_comparability(periods)
+
+    uncertainty = _uncertainty(request, periods, change, comparability)
     png = out_dir / "analysis.png"
     render_png(png, index, bbox, periods, target_values, baseline_values)
     result = {
-        "index": index, "periods": periods, "change": change, "uncertainty": uncertainty,
+        "index": index, "index_definition": INDEX_DEFINITIONS[index], "periods": periods, "change": change,
+        "comparability": comparability, "uncertainty": uncertainty,
         "png": str(png), "provenance": str(out_dir / "provenance.json"),
     }
     write_provenance(out_dir / "provenance.json", state, result, shape, llm_model)
     return result
 
 
-def _period(start: date, end: date, item: dict, values: np.ndarray, excluded: float, tried: list[dict]) -> dict:
-    return {
+def _period(start: date, end: date, picked: dict, index: str, px_km2: float) -> dict:
+    first = picked["scenes"][0]
+    period = {
         "window": f"{start} / {end}",
-        "scene": {k: item.get(k) for k in ("id", "datetime", "platform", "tile", "cloud_cover", "stac_url")},
-        "scenes_tried": tried,
-        "stats": index_stats(values, excluded),
+        "date": (first["datetime"] or "")[:10],
+        "platform": first["platform"],
+        "scenes": [{k: item.get(k) for k in ("id", "datetime", "tile", "cloud_cover", "stac_url")}
+                   for item in picked["scenes"]],
+        "overpasses_tried": picked["tried"],
+        "stats": {**index_stats(picked["values"], picked["excluded"]),
+                  "no_data_fraction": _r((picked["scl"] == 0).mean())},
     }
+    if index == "ndwi":
+        period["water"] = water_extent(picked["values"], px_km2)
+    return period
 
 
-def _uncertainty(request, periods: dict, change: dict | None) -> list[str]:
+def seasonal_offset_days(a: date, b: date) -> int:
+    """Distance between two dates' positions in the annual cycle, ignoring the year (0..182 days)."""
+    # Day-of-year shifts by one after February in leap years, so compare in one non-leap year.
+    a, b = (date(2001, d.month, min(d.day, 28) if d.month == 2 else d.day) for d in (a, b))
+    gap = abs((a - b).days)
+    return min(gap, 365 - gap)
+
+
+def date_comparability(periods: dict) -> dict | None:
+    """How comparable the baseline and target acquisition dates are; None without a dated baseline."""
+    if "baseline" not in periods:
+        return None
+    t, b = (_day(periods[p]["date"]) for p in ("target", "baseline"))
+    if date.min in (t, b):
+        return None
+    offset = seasonal_offset_days(t, b)
+    return {"days_apart": abs((t - b).days), "seasonal_offset_days": offset,
+            "same_season": offset <= SEASON_TOLERANCE_DAYS, "same_year": t.year == b.year,
+            "tolerance_days": SEASON_TOLERANCE_DAYS}
+
+
+def _uncertainty(request, periods: dict, change: dict | None, comparability: dict | None) -> list[str]:
     notes = []
+    label = INDEX_DEFINITIONS[request.index]["name"]
     excluded = max(p["stats"]["excluded_fraction"] for p in periods.values())
     if excluded > 0:
         notes.append(f"about {excluded:.0%} of the area is water (sea, lakes) and is excluded from "
-                     f"{request.index.upper()} statistics; percentages refer to the remaining land")
+                     f"{label} statistics; percentages refer to the remaining land")
     for name, period in periods.items():
-        share = period["stats"]["valid_fraction"]
+        share, no_data = period["stats"]["valid_fraction"], period["stats"]["no_data_fraction"]
         if share < WELL_COVERED:
-            notes.append(f"{name}: only {share:.0%} of the area is clear (rest is cloud, shadow or outside the tile)")
-        if len(period["scenes_tried"]) > 1:
-            notes.append(f"{name}: the clearest scenes in the catalog were cloudy over the area; "
-                         f"used {period['scene']['id']} after trying {len(period['scenes_tried'])}")
+            outside = f"{no_data:.0%} not covered by that date's tiles, " if no_data > 0.01 else ""
+            notes.append(f"{name}: only {share:.0%} of the area is clear ({outside}the rest cloud or shadow)")
+        if len(period["overpasses_tried"]) > 1:
+            notes.append(f"{name}: the clearest overpasses in the catalog were cloudy over the area or only "
+                         f"partly covered it; used {period['date']} after trying {len(period['overpasses_tried'])}")
     if request.has_baseline and "baseline" not in periods:
         notes.append("no scene found for the baseline period: change could not be computed")
     if change is not None:
         if change["valid_fraction_both"] < WELL_COVERED:
             notes.append(f"change is computed on the {change['valid_fraction_both']:.0%} of the area clear on both dates")
-        t, b = periods["target"]["scene"], periods["baseline"]["scene"]
-        gap = abs((_day(t["datetime"]) - _day(b["datetime"])).days)
-        notes.append(f"single-scene snapshots {gap} days apart: short-term effects (rain, irrigation, harvest, "
-                     f"tide) can dominate the difference")
+        t, b = periods["target"], periods["baseline"]
+        if change.get("water"):
+            observed = sorted(periods[p]["water"]["observed_km2"] for p in ("baseline", "target"))
+            if observed[0] < 0.9 * observed[1]:
+                notes.append(f"the per-date water totals cover different ground ({observed[0]} vs {observed[1]} km2 "
+                             f"observed), so they must not be compared with each other; only the gained/lost "
+                             f"figures, on ground clear on both dates, measure change")
+            notes.append(f"water area is compared on the {change['water']['compared_km2']} km2 clear on both dates; "
+                         f"per-date totals count only clear pixels, and Sentinel-2's scene classification "
+                         f"sometimes labels bright or turbid water as cloud, which removes it from that date")
+        if comparability:
+            notes.append(f"single-scene snapshots {comparability['days_apart']} days apart: short-term effects "
+                         f"(rain, irrigation, harvest, tide) can dominate the difference")
+            if not comparability["same_season"]:
+                notes.append(f"not seasonally comparable: the dates ({_date(periods['baseline'])} and "
+                             f"{_date(periods['target'])}) are {comparability['seasonal_offset_days']} days apart "
+                             f"in the annual cycle, so normal seasonal change (rainy season, crop growth, "
+                             f"senescence) is probably part of the difference; compare the same months of "
+                             f"different years to separate it")
+            elif not comparability["same_year"]:
+                notes.append("same time of year in different years: the seasonal cycle is roughly controlled for, "
+                             "but each year's weather (e.g. a wetter or drier season) is not")
         if t["platform"] != b["platform"]:
             notes.append(f"different satellites ({b['platform']} vs {t['platform']}); "
                          f"L2A processing makes them comparable but not identical")
@@ -238,7 +374,7 @@ def _uncertainty(request, periods: dict, change: dict | None) -> list[str]:
 
 
 def _day(iso: str | None) -> date:
-    return datetime.fromisoformat(iso).date() if iso else date.min
+    return date.fromisoformat(iso[:10]) if iso else date.min
 
 
 def _output_dir(place: str, index: str) -> Path:
@@ -257,7 +393,7 @@ def render_png(path: Path, index: str, bbox: list[float], periods: dict,
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    name = index.upper()
+    name = INDEX_DEFINITIONS[index]["name"]
     panels = []
     if baseline is not None:
         panels.append((f"{name} {_date(periods['baseline'])}", baseline, INDEX_CMAP[index], -1, 1))
@@ -282,7 +418,7 @@ def render_png(path: Path, index: str, bbox: list[float], periods: dict,
 
 
 def _date(period: dict) -> str:
-    return (period["scene"]["datetime"] or "")[:10]
+    return period["date"]
 
 
 def write_provenance(path: Path, state: dict, result: dict, shape: tuple[int, int], llm_model: str) -> None:
@@ -298,6 +434,7 @@ def write_provenance(path: Path, state: dict, result: dict, shape: tuple[int, in
         "llm_model": llm_model,
         "method": {
             "index": result["index"],
+            "definition": result["index_definition"],
             "formula": f"({a_name} - {b_name}) / ({a_name} + {b_name})",
             "reflectance": "DN * scale + offset, from the STAC raster:bands extension",
             "cloud_mask": f"Sentinel-2 SCL, clear classes kept: {list(SCL_CLEAR)}; "
@@ -305,15 +442,20 @@ def write_provenance(path: Path, state: dict, result: dict, shape: tuple[int, in
             "excluded_classes": list(INDEX_EXCLUDED.get(result["index"], ())),
             "grid": {"crs": "EPSG:4326", "height": shape[0], "width": shape[1],
                      "resampling": "average (reflectance), nearest (SCL)"},
-            "scene_selection": f"clearest first; first with >= {MIN_VALID:.0%} clear pixels, "
-                               f"at most {MAX_SCENES_TRIED} tried per period",
+            "scene_selection": f"overpasses (same day and satellite) clearest first, each mosaicked from up "
+                               f"to {MAX_TILES} tiles (first tile with data wins per pixel); first with >= "
+                               f"{MIN_VALID:.0%} clear pixels, at most {MAX_SCENES_TRIED} tried per period",
+            "pixel_area_km2": pixel_area_km2(state["bbox"], shape),
+            **({"water_threshold": f"NDWI > {WATER_THRESHOLD}"} if result["index"] == "ndwi" else {}),
             "change_threshold": CHANGE_THRESHOLD,
         },
         "periods": {
-            name: {**period, "band_hrefs": _band_hrefs(state, name, period["scene"]["id"], (a_name, b_name, "scl"))}
+            name: {**period, "band_hrefs": {scene["id"]: _band_hrefs(state, name, scene["id"], (a_name, b_name, "scl"))
+                                            for scene in period["scenes"]}}
             for name, period in result["periods"].items()
         },
         "change": result["change"],
+        "comparability": result["comparability"],
         "uncertainty": result["uncertainty"],
         "outputs": {"png": Path(result["png"]).name},
         "software": _versions(),
@@ -322,7 +464,8 @@ def write_provenance(path: Path, state: dict, result: dict, shape: tuple[int, in
 
 
 def _band_hrefs(state: dict, period: str, item_id: str, names: tuple[str, ...]) -> dict:
-    items = state["items"] if period == "target" else state.get("baseline_items", [])
+    fallback = state["items"] if period == "target" else state.get("baseline_items", [])
+    items = (state.get("candidates") or {}).get(period) or fallback
     item = next(i for i in items if i["id"] == item_id)
     return {n: item["bands"][n]["href"] for n in names}
 

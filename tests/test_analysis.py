@@ -1,4 +1,6 @@
 """Pure pixel computations: no network, no LLM."""
+from datetime import date
+
 import numpy as np
 import pytest
 
@@ -75,3 +77,53 @@ def test_grid_is_capped_and_never_finer_than_10m():
     assert max(big) == analysis.GRID_MAX_PX
     small = analysis.grid_shape([1.0, 43.0, 1.01, 43.01])       # ~0.8 x 1.1 km
     assert small == pytest.approx((111, 81), abs=1)             # ~10 m pixels
+
+
+@pytest.mark.parametrize("a, b, expected", [
+    ("2025-07-05", "2025-09-03", 60),    # same year, two months apart in the cycle
+    ("2024-07-10", "2025-07-15", 5),     # one year apart, same season
+    ("2024-12-20", "2025-01-10", 21),    # wraps around the new year
+    ("2025-01-01", "2025-07-02", 182),   # opposite seasons
+])
+def test_seasonal_offset_ignores_the_year(a, b, expected):
+    assert analysis.seasonal_offset_days(date.fromisoformat(a), date.fromisoformat(b)) == expected
+
+
+def test_ndwi_is_always_named_mcfeeters_not_gao():
+    ndwi = analysis.INDEX_DEFINITIONS["ndwi"]
+    assert "McFeeters" in ndwi["name"] and "Gao" in ndwi["not"]
+    assert analysis.INDEX_BANDS["ndwi"] == ("green", "nir")  # the definition and the computation agree
+
+
+def test_mosaic_fills_only_where_the_first_tile_has_no_data():
+    nan = np.nan
+    first = (np.array([0.5, nan, nan], dtype=np.float32), np.array([4, 9, 0], dtype=np.uint8))  # clear, cloud, no data
+    second = (np.array([0.1, 0.2, 0.3], dtype=np.float32), np.array([4, 4, 4], dtype=np.uint8))
+    values, scl = analysis.mosaic([first, second])
+    # Pixel 0 keeps the first tile, pixel 1 stays cloud-masked (same overpass, same cloud), pixel 2 is filled.
+    assert values[0] == pytest.approx(0.5) and np.isnan(values[1]) and values[2] == pytest.approx(0.3)
+    assert scl.tolist() == [4, 9, 4]
+
+
+def test_acquisitions_group_tiles_of_one_overpass_clearest_first():
+    def item(i, day, platform, cloud):
+        return {"id": i, "datetime": f"{day}T11:00:00", "platform": platform, "cloud_cover": cloud}
+    groups = analysis.acquisitions([
+        item("A1", "2025-07-05", "sentinel-2a", 20), item("B1", "2025-07-10", "sentinel-2b", 2),
+        item("A2", "2025-07-05", "sentinel-2a", 10), item("B2", "2025-07-10", "sentinel-2b", 4)])
+    assert [[i["id"] for i in g] for g in groups] == [["B1", "B2"], ["A2", "A1"]]
+
+
+def test_water_change_counts_only_pixels_clear_on_both_dates():
+    before = np.array([0.5, -0.5, 0.5, np.nan], dtype=np.float32)  # water, land, water, cloud
+    after = np.array([0.5, 0.4, -0.3, 0.6], dtype=np.float32)      # water, water, land, water
+    w = analysis.water_change(before, after, px_km2=0.01)
+    assert w == {"compared_km2": 0.03, "water_before_km2": 0.02, "water_after_km2": 0.02,
+                 "gained_km2": 0.01, "lost_km2": 0.01, "net_km2": 0.0}
+
+
+def test_pixel_area_matches_the_bbox_area():
+    bbox = [-16.0, 15.8, -15.7, 16.4]
+    shape = analysis.grid_shape(bbox)
+    width_m, height_m = analysis._extent_m(bbox)
+    assert analysis.pixel_area_km2(bbox, shape) * shape[0] * shape[1] == pytest.approx(width_m * height_m / 1e6)

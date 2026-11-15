@@ -78,12 +78,20 @@ def _describe(node: str, change: dict) -> str:
         if change.get("analysis_error"):
             return f"skipped: {change['analysis_error']}"
         result = change["analysis"]
-        parts = [f"{name} {p['stats'].get('mean', 'n/a')} ({p['stats']['valid_fraction']:.0%} clear)"
-                 for name, p in result["periods"].items()]
+        parts = []
+        for name, p in result["periods"].items():
+            water = f", {p['water']['water_km2']} km2 water" if p.get("water") else ""
+            tiles = f", {len(p['scenes'])} tiles" if len(p["scenes"]) > 1 else ""
+            parts.append(f"{name} {p['date']} {p['stats'].get('mean', 'n/a')} "
+                         f"({p['stats']['valid_fraction']:.0%} clear{tiles}{water})")
         if result["change"]:
             mean_change = result["change"].get("mean_change")
             parts.append("change " + ("n/a" if mean_change is None else f"{mean_change:+}"))
-        return f"{result['index'].upper()} mean: " + ", ".join(parts) + f" -> {result['provenance']}"
+            if water := result["change"].get("water"):
+                parts.append(f"water +{water['gained_km2']} / -{water['lost_km2']} km2")
+        if result["comparability"] and not result["comparability"]["same_season"]:
+            parts.append("different seasons")
+        return f"{result['index_definition']['name']} mean: " + ", ".join(parts) + f" -> {result['provenance']}"
     return "done"
 
 

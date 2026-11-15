@@ -191,11 +191,19 @@ def s2(item_id, day, cloud=5):
 
 
 def fake_pixels(scenes):
-    """load_bands replacement: scenes maps item id -> (nir DN, red DN, SCL class), uniform over the grid."""
+    """load_bands replacement: scenes maps item id -> (nir DN, red DN, SCL class[, green DN[, half]]),
+    uniform over the grid. half = "west"/"east" makes the tile cover only that half (SCL 0 elsewhere)."""
     def load(item, names, bbox, shape):
-        nir, red, scl = scenes[item["id"]]
-        values = {"nir": nir, "red": red, "green": 1000, "scl": scl}
-        return {n: np.full(shape, values[n], dtype=np.uint16) for n in names}
+        nir, red, scl, *extra = scenes[item["id"]]
+        green = extra[0] if extra else 1000
+        half = extra[1] if len(extra) > 1 else None
+        values = {"nir": nir, "red": red, "green": green, "scl": scl}
+        out = {n: np.full(shape, values[n], dtype=np.uint16) for n in names}
+        if half:
+            outside = np.s_[:, shape[1] // 2:] if half == "west" else np.s_[:, :shape[1] // 2]
+            for n in names:
+                out[n][outside] = 0
+        return out
     return load
 
 
@@ -222,13 +230,17 @@ def test_change_question_writes_png_and_provenance(setup, monkeypatch, outputs):
     assert a["periods"]["target"]["stats"]["mean"] == pytest.approx(0.714, abs=1e-3)
     assert a["change"]["share_increase"] == 1.0
     assert any("30 days apart" in note for note in a["uncertainty"])
+    assert a["comparability"]["same_season"]  # mid-June vs mid-July: within tolerance, no seasonal warning
+    assert not any("not seasonally comparable" in note for note in a["uncertainty"])
     assert Path(a["png"]).stat().st_size > 0
     prov = json.loads(Path(a["provenance"]).read_text(encoding="utf-8"))
     assert prov["query"] == "did vegetation change?"
-    assert prov["periods"]["baseline"]["scene"]["id"] == "JUNE"
-    assert prov["periods"]["target"]["band_hrefs"]["nir"] == "https://cog/nir.tif"
+    assert prov["periods"]["baseline"]["scenes"][0]["id"] == "JUNE"
+    assert prov["periods"]["target"]["band_hrefs"]["JULY"]["nir"] == "https://cog/nir.tif"
     assert prov["final_request"]["baseline_start_date"] == "2025-06-01"
     assert prov["software"]["rasterio"]
+    assert prov["method"]["definition"]["sentinel2"] == "(B08 - B04) / (B08 + B04)"
+    assert prov["comparability"]["days_apart"] == 30
     assert result["answer"] == "SUMMARY"
 
 
@@ -238,9 +250,9 @@ def test_cloudy_scene_over_area_falls_back_to_next(setup, monkeypatch, outputs):
     monkeypatch.setattr(analysis, "load_bands", fake_pixels({"CLOUDY": (3000, 2000, 9), "CLEAR": (3000, 2000, 4)}))
     a = graph.build_graph().invoke({"query": "q"})["analysis"]
 
-    assert a["periods"]["target"]["scene"]["id"] == "CLEAR"
-    assert a["periods"]["target"]["scenes_tried"] == [
-        {"id": "CLOUDY", "valid_fraction": 0.0}, {"id": "CLEAR", "valid_fraction": 1.0}]
+    assert a["periods"]["target"]["scenes"][0]["id"] == "CLEAR"
+    assert [(t["tiles"], t["valid_fraction"]) for t in a["periods"]["target"]["overpasses_tried"]] == [
+        (["CLOUDY"], 0.0), (["CLEAR"], 1.0)]
     assert a["change"] is None
     assert any("after trying 2" in note for note in a["uncertainty"])
 
@@ -309,3 +321,108 @@ def test_single_period_summary_says_no_baseline(setup):
     setup(july(), [item(5)])
     graph.build_graph().invoke({"query": "q"})
     assert "Baseline period results (best first): none" in graph.get_llm().summary_prompts[-1]
+
+
+def test_change_across_seasons_is_flagged(setup, monkeypatch, outputs):
+    # Dakar-like: July baseline vs September target is rainy-season greening, not necessarily change.
+    request = SearchRequest(place="Dakar", start_date=date(2025, 9, 1), end_date=date(2025, 9, 30), index="ndvi",
+                            baseline_start_date=date(2025, 7, 1), baseline_end_date=date(2025, 7, 31))
+    by_period = {7: [s2("JUL", "2025-07-05")], 9: [s2("SEP", "2025-09-03")]}
+    setup(request, lambda start: by_period[start.month])
+    monkeypatch.setattr(analysis, "load_bands", fake_pixels({"JUL": (3000, 2000, 4), "SEP": (4000, 1500, 4)}))
+    result = graph.build_graph().invoke({"query": "q"})
+
+    a = result["analysis"]
+    assert a["comparability"] == {"days_apart": 60, "seasonal_offset_days": 60, "same_season": False,
+                                  "same_year": True, "tolerance_days": analysis.SEASON_TOLERANCE_DAYS}
+    assert any("not seasonally comparable" in note and "2025-07-05" in note for note in a["uncertainty"])
+
+
+def test_same_season_different_years_notes_weather(setup, monkeypatch, outputs):
+    request = SearchRequest(place="Dakar", start_date=date(2025, 7, 1), end_date=date(2025, 7, 31), index="ndvi",
+                            baseline_start_date=date(2024, 7, 1), baseline_end_date=date(2024, 7, 31))
+    by_year = {2024: [s2("Y24", "2024-07-10")], 2025: [s2("Y25", "2025-07-15")]}
+    setup(request, lambda start: by_year[start.year])
+    monkeypatch.setattr(analysis, "load_bands", fake_pixels({"Y24": (3000, 2000, 4), "Y25": (3000, 2000, 4)}))
+    a = graph.build_graph().invoke({"query": "q"})["analysis"]
+
+    assert a["comparability"]["same_season"] and not a["comparability"]["same_year"]
+    assert any("each year's weather" in note for note in a["uncertainty"])
+
+
+def test_ndwi_answer_names_the_mcfeeters_variant(setup, monkeypatch, outputs):
+    setup(july(index="ndwi"), [s2("W", "2025-07-15")])
+    monkeypatch.setattr(analysis, "load_bands", fake_pixels({"W": (1500, 1, 6)}))
+
+    def invoke(prompt):
+        raise TimeoutError("deadline exceeded")
+
+    monkeypatch.setattr(graph.get_llm(), "invoke", invoke)  # summary fails -> deterministic fallback answer
+    result = graph.build_graph().invoke({"query": "q"})
+
+    assert result["analysis"]["index_definition"]["name"] == "NDWI (McFeeters)"
+    assert "NDWI (McFeeters) analysis, (B03 - B08) / (B03 + B08)" in result["answer"]  # fallback answer
+
+
+def test_overpass_tiles_are_mosaicked_even_beyond_the_display_limit(setup, monkeypatch, outputs):
+    # The area straddles two tiles of the same overpass; the cloudier one is outside the top `limit`=1.
+    west = {**s2("WEST", "2025-07-15", cloud=1), "tile": "28PCC"}
+    east = {**s2("EAST", "2025-07-15", cloud=3), "tile": "28PDC"}
+    other_day = s2("OTHER", "2025-07-20", cloud=2)
+    setup(july(index="ndvi", limit=1), [west, east, other_day])
+    monkeypatch.setattr(analysis, "load_bands", fake_pixels({
+        "WEST": (3000, 2000, 4, 1000, "west"), "EAST": (3000, 2000, 4, 1000, "east"), "OTHER": (3000, 2000, 9)}))
+    result = graph.build_graph().invoke({"query": "q"})
+
+    target = result["analysis"]["periods"]["target"]
+    assert [i["id"] for i in result["items"]] == ["WEST"]          # what the user is shown
+    assert [s["id"] for s in target["scenes"]] == ["WEST", "EAST"]  # what the analysis used
+    assert target["stats"]["valid_fraction"] == 1.0 and target["stats"]["no_data_fraction"] == 0.0
+
+
+def test_partial_tile_coverage_is_reported_as_no_data_not_cloud(setup, monkeypatch, outputs):
+    setup(july(index="ndvi"), [s2("HALF", "2025-07-15")])
+    monkeypatch.setattr(analysis, "load_bands", fake_pixels({"HALF": (3000, 2000, 4, 1000, "west")}))
+    a = graph.build_graph().invoke({"query": "q"})["analysis"]
+
+    assert a["periods"]["target"]["stats"]["no_data_fraction"] == pytest.approx(0.5, abs=0.01)
+    assert any("50% not covered by that date's tiles" in note for note in a["uncertainty"])
+
+
+def test_ndwi_change_reports_water_area_gained_and_lost(setup, monkeypatch, outputs):
+    # The lake fills the west half in May and the whole box in October; the land does not change.
+    request = SearchRequest(place="Lac de Guiers", start_date=date(2025, 10, 1), end_date=date(2025, 10, 31),
+                            index="ndwi", baseline_start_date=date(2025, 5, 1), baseline_end_date=date(2025, 5, 31))
+    by_month = {5: [s2("MAY_LAKE", "2025-05-26"), s2("MAY_LAND", "2025-05-26", cloud=6)],
+                10: [s2("OCT", "2025-10-28")]}
+    setup(request, lambda start: by_month[start.month])
+    # Water: green 0.2, nir 0.05 -> NDWI +0.6. Land: green 0.05, nir 0.3 -> NDWI -0.71.
+    monkeypatch.setattr(analysis, "load_bands", fake_pixels({
+        "MAY_LAKE": (1500, 1, 6, 3000, "west"), "MAY_LAND": (4000, 1, 4, 1500, "east"), "OCT": (1500, 1, 6, 3000)}))
+    result = graph.build_graph().invoke({"query": "q"})
+
+    a = result["analysis"]
+    may, october = a["periods"]["baseline"]["water"], a["periods"]["target"]["water"]
+    assert may["water_share_of_observed"] == pytest.approx(0.5, abs=0.01) and october["water_share_of_observed"] == 1.0
+    assert october["water_km2"] == pytest.approx(2 * may["water_km2"], rel=0.01)
+    water = a["change"]["water"]
+    assert water["lost_km2"] == 0 and water["gained_km2"] == pytest.approx(may["water_km2"], rel=0.01)
+    assert water["net_km2"] == pytest.approx(water["gained_km2"], abs=0.01)
+    assert any("bright or turbid water as cloud" in note for note in a["uncertainty"])
+    prov = json.loads(Path(a["provenance"]).read_text(encoding="utf-8"))
+    assert prov["method"]["water_threshold"] == "NDWI > 0.0"
+    assert set(prov["periods"]["baseline"]["band_hrefs"]) == {"MAY_LAKE", "MAY_LAND"}
+
+
+def test_water_totals_over_different_ground_are_flagged(setup, monkeypatch, outputs):
+    # May sees only the west half (e.g. the rest masked as cloud), October sees everything.
+    request = SearchRequest(place="Lac de Guiers", start_date=date(2025, 10, 1), end_date=date(2025, 10, 31),
+                            index="ndwi", baseline_start_date=date(2025, 5, 1), baseline_end_date=date(2025, 5, 31))
+    by_month = {5: [s2("MAY", "2025-05-26")], 10: [s2("OCT", "2025-10-28")]}
+    setup(request, lambda start: by_month[start.month])
+    monkeypatch.setattr(analysis, "load_bands", fake_pixels({
+        "MAY": (1500, 1, 6, 3000, "west"), "OCT": (1500, 1, 6, 3000)}))
+    a = graph.build_graph().invoke({"query": "q"})["analysis"]
+
+    assert any("cover different ground" in note for note in a["uncertainty"])
+    assert a["change"]["water"]["gained_km2"] == 0  # the unseen half is not counted as new water

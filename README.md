@@ -46,7 +46,7 @@ graph TD
 > How did vegetation around Dakar change between July and September 2025?
   [parse_request] {...,"index":"ndvi","start_date":"2025-09-01",...,"baseline_start_date":"2025-07-01",...}
   [search] attempt 1: 5 result(s), baseline 5
-  [analyze] NDVI mean: target 0.309 (59% clear), baseline 0.202 (71% clear), change +0.095 -> outputs\...\provenance.json
+  [analyze] NDVI mean: target 0.309 (59% clear), baseline 0.202 (71% clear), change +0.095, different seasons -> outputs\...\provenance.json
 ```
 
 `analysis.py`, Sentinel-2 only (Earth Search's Landsat is in a requester-pays bucket):
@@ -56,8 +56,21 @@ graph TD
 - **Masks what can't be trusted**: SCL clouds, shadows and cirrus plus a 60 m buffer (SCL misses thin
   cloud edges). For NDVI, water is excluded and reported as a share, otherwise the sea in a coastal
   bounding box shows up as "stable vegetation ~ 0".
-- **Picks scenes by coverage over the area, not the tile**: the clearest catalog scene can still be cloudy
-  over your city; the next one is tried (up to 3) until ≥50% of the land is clear.
+- **Mosaics each overpass and picks it by coverage over the area, not the tile**: an area often straddles
+  Sentinel-2 tile edges, so all tiles of one overpass (same day, same satellite, up to 4) are combined, using
+  every search result and not only the top ones shown. The clearest overpass can still be cloudy over your
+  city; the next one is tried (up to 3) until ≥50% of the land is clear. Area outside the tiles is reported
+  as "not covered", separately from cloud.
+- **Names the index exactly**: "NDWI" means two different indices in the literature. This agent computes
+  McFeeters' open-water NDWI, (B03 - B08) / (B03 + B08), never Gao's NIR-SWIR vegetation water-content index,
+  and says so in the answer, the PNG and `provenance.json`.
+- **Checks the dates are comparable**: dates more than 30 days apart in the annual cycle (ignoring the year)
+  get a "not seasonally comparable" warning, because the difference then includes normal phenology. July vs
+  September in Dakar is mostly rainy-season greening. Same months in different years get a weather caveat instead.
+- **Answers water questions in km², not mean NDWI**: water is NDWI > 0 on clear pixels. Change is gained / lost /
+  net km² on ground clear on both dates only. Mean NDWI over a box that is mostly land drops when vegetation
+  greens, which once made a lake that had *grown* look like it had shrunk. Per-date totals that cover different
+  ground are flagged as not comparable.
 - **States its uncertainty**: clear share per date, days between scenes, sensor differences, missing baseline.
   The LLM may only cite these numbers and may name causes only as hypotheses.
 - **Writes** `outputs/<time>_<place>_<index>/analysis.png` (both dates and the change map) and

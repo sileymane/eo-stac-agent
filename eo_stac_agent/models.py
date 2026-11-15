@@ -60,6 +60,7 @@ class AgentState(TypedDict, total=False):
     bbox: list[float] | None  # resolved area of interest
     items: list[dict]         # ranked search results
     baseline_items: list[dict]  # ranked results for the baseline period (change questions only)
+    candidates: dict          # all results per period ("target", "baseline"), for analysis mosaics
     attempts: int             # number of STAC searches performed
     relaxations: list[str]    # human-readable log of what was relaxed
     analysis: dict | None     # index statistics + output paths, when an index was requested
